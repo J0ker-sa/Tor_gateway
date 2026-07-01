@@ -98,6 +98,47 @@ _tor_uid: int = 0                     # Populated after Tor starts
 
 
 # ---------------------------------------------------------------------------
+# Transactional startup tracking
+# ---------------------------------------------------------------------------
+# Each step that modifies system state registers itself here when it
+# succeeds. Teardown walks this set in REVERSE order, so an early
+# failure (e.g., Tor can't bootstrap) doesn't try to undo steps that
+# never ran. The keys are stable strings; the values are the bound
+# restore functions.
+#
+# Example: if footprint.harden() raises, no entry is added and
+# teardown() will only run footprint.restore() if the MAC-spoof
+# sub-step was the one that completed.
+_RESTORE_REGISTRY: list[tuple[str, callable]] = []
+
+
+def _register_restore(label: str, fn) -> None:
+    """Append a teardown step. Order of registration = order of undo
+    (reverse at teardown time)."""
+    _RESTORE_REGISTRY.append((label, fn))
+
+
+def _registered_restore() -> None:
+    """Undo everything that was registered, in reverse order.
+
+    Idempotent: each registered function is itself safe to call when
+    its corresponding state isn't present (the modules return early).
+    Errors are logged, never raised, so a single failed step doesn't
+    leave the rest of the teardown undone.
+    """
+    log.info("Registered restore steps (in reverse):")
+    for label, _fn in reversed(_RESTORE_REGISTRY):
+        log.info("  ↻ %s", label)
+    log.info("")
+    for label, fn in reversed(_RESTORE_REGISTRY):
+        try:
+            fn()
+        except Exception as exc:
+            log.error("Restore step %r failed: %s", label, exc)
+    _RESTORE_REGISTRY.clear()
+
+
+# ---------------------------------------------------------------------------
 # Watchdog thread
 # ---------------------------------------------------------------------------
 WATCHDOG_INTERVAL = 5     # seconds between health checks
@@ -132,8 +173,11 @@ def _watchdog_loop() -> None:
             log.critical("WATCHDOG: Tor process has died unexpectedly!")
             log.critical("=" * 60)
 
-            # Immediately block all traffic
-            firewall.panic()
+            # Immediately block all traffic. Pass the known tor_uid so
+            # the kill-switch's Tor-UID exemption matches the (now
+            # dead) Tor process. If we don't know it, the kill-switch
+            # blocks everything (safest).
+            firewall.panic(tor_uid=tor.get_uid() or 0)
 
             if restart_count >= WATCHDOG_MAX_RESTARTS:
                 log.critical(
@@ -190,16 +234,17 @@ def _signal_handler(signum: int, frame) -> None:
 # Teardown
 # ---------------------------------------------------------------------------
 def _teardown() -> None:
-    """Execute the full reverse teardown sequence.
+    """Execute the registered teardown steps in reverse order.
 
-    Order is the reverse of startup:
-        1. DNS → remove lock, restore resolv.conf
-        2. Firewall → delete nftables table
-        3. Tor → graceful termination
-        4. Footprint → restore MAC, hostname, timezone, TTL, IPv6
-
-    Each step is wrapped in a try/except to ensure we attempt all
-    steps even if one fails.
+    Each startup step that succeeded registered its undo function via
+    _register_restore(). This function walks them in reverse, so:
+        - only completed steps are undone (no half-attempts at things
+          that never ran)
+        - each step is independently try/except'd so one failure
+          doesn't prevent the rest
+        - the registry is cleared after a successful run, so the
+          function is idempotent (calling _teardown() twice does
+          nothing the second time).
     """
     global _is_tearing_down
 
@@ -215,29 +260,8 @@ def _teardown() -> None:
     log.info("╚══════════════════════════════════════════════════╝")
     log.info("")
 
-    # Step 1: Unlock and restore DNS
-    try:
-        dns.restore()
-    except Exception as exc:
-        log.error("DNS restore failed: %s", exc)
-
-    # Step 2: Remove firewall rules
-    try:
-        firewall.teardown()
-    except Exception as exc:
-        log.error("Firewall teardown failed: %s", exc)
-
-    # Step 3: Stop Tor
-    try:
-        tor.stop()
-    except Exception as exc:
-        log.error("Tor stop failed: %s", exc)
-
-    # Step 4: Restore footprint
-    try:
-        footprint.restore()
-    except Exception as exc:
-        log.error("Footprint restore failed: %s", exc)
+    # Run all registered undo steps (reverse order of registration).
+    _registered_restore()
 
     log.info("")
     log.info("╔══════════════════════════════════════════════════╗")
@@ -284,16 +308,25 @@ def run() -> None:
 
     try:
         # ── Step 1: Footprint hardening ──
+        # The individual sub-steps register their own undo functions
+        # so a partial harden() (e.g., MAC success, hostname fail)
+        # still unwinds cleanly.
+        _register_restore("footprint", footprint.restore)
         footprint.harden()
 
         # ── Step 2: Start Tor ──
+        # Tor's stop() is itself idempotent and safe to call when
+        # start() never produced a live process.
         _tor_uid = tor.start()
+        _register_restore("tor", tor.stop)
 
         # ── Step 3: Apply firewall ──
         firewall.apply(_tor_uid)
+        _register_restore("firewall", firewall.teardown)
 
         # ── Step 4: Lock DNS ──
         dns.lock()
+        _register_restore("dns", dns.restore)
 
         # ── Step 5: Start watchdog ──
         watchdog_thread = threading.Thread(

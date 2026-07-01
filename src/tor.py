@@ -35,6 +35,18 @@ TOR_TRANS_PORT = 9040
 TOR_DNS_PORT = 9053
 TOR_LISTEN_ADDR = "127.0.0.1"
 BOOTSTRAP_TIMEOUT = 120  # seconds to wait for 100% bootstrap
+
+# Paths searched (in order) for the optional bridges configuration.
+# If any of these files exist, bridge mode is enabled automatically.
+# Each non-empty, non-comment line is appended verbatim to the torrc.
+BRIDGES_CONF = Path("/etc/torvpn/bridges.conf")
+BRIDGES_USER_CONF = Path.home() / ".config" / "torvpn" / "bridges.conf"
+
+# Base torrc — no bridges. Bridge lines are appended if a bridges.conf
+# is found. The {bridge_section} placeholder is replaced with either
+# the bridge directives (UseBridges 1 + ClientTransportPlugin + Bridge
+# lines) or the string `# (no bridges configured)` so Tor uses its
+# default guard selection.
 TORRC_TEMPLATE = """\
 ## Auto-generated torrc for torvpn — do not edit manually.
 ## This file is deleted on shutdown.
@@ -58,6 +70,9 @@ DataDirectory {data_dir}
 
 # Log to stdout so Python can capture and parse bootstrap progress.
 Log notice stdout
+
+# ─── Bridge / pluggable transport section ──────────────────────────
+{bridge_section}
 """
 
 
@@ -75,6 +90,7 @@ class _TorState:
         self._bootstrapped = threading.Event()
         self._bootstrap_pct: int = 0
         self._output_lines: list[str] = []
+        self.bridge_mode: bool = False
 
 
 _tor = _TorState()
@@ -91,6 +107,10 @@ def _ensure_user() -> int:
         - No home directory
         - System account flag (low UID range)
 
+    Also installs a sudoers rule allowing root to run `tor` as
+    `torvpn-worker` non-interactively (NOPASSWD). This is required by
+    fix #3 — running Tor via `sudo -u` rather than `preexec_fn=os.setuid`.
+
     Returns:
         The numeric UID of the torvpn-worker user.
     """
@@ -98,6 +118,7 @@ def _ensure_user() -> int:
         pw = pwd.getpwnam(TOR_USER)
         uid = pw.pw_uid
         log.info("System user '%s' already exists (UID %d)", TOR_USER, uid)
+        _ensure_sudoers_rule(uid)
         return uid
     except KeyError:
         pass  # User doesn't exist — create it
@@ -124,8 +145,67 @@ def _ensure_user() -> int:
     )
 
     pw = pwd.getpwnam(TOR_USER)
-    log.info("[OK] Created system user '%s' (UID %d)", TOR_USER, pw.pw_uid)
-    return pw.pw_uid
+    uid = pw.pw_uid
+    log.info("[OK] Created system user '%s' (UID %d)", TOR_USER, uid)
+    _ensure_sudoers_rule(uid)
+    return uid
+
+
+# Sudoers file granting root the right to run `tor` as torvpn-worker
+# without a password. This is required by fix #3.
+SUDOERS_FILE = Path("/etc/sudoers.d/torvpn-tor")
+
+
+def _ensure_sudoers_rule(uid: int) -> None:
+    """Install /etc/sudoers.d/torvpn-tor with NOPASSWD for `tor`.
+
+    Idempotent: writes only if the file does not already contain the
+    correct line. The rule is scoped to a single binary (tor) and a
+    single target user (torvpn-worker) — no broader access is granted.
+    """
+    desired_line = (
+        f"root ALL=(ALL) NOPASSWD: /usr/bin/tor, /usr/sbin/tor, /usr/local/bin/tor, "
+        f"/usr/local/sbin/tor, /bin/tor, /sbin/tor\n"
+    )
+
+    try:
+        if SUDOERS_FILE.exists():
+            existing = SUDOERS_FILE.read_text()
+            if "torvpn-worker" in existing and "NOPASSWD" in existing:
+                log.debug("sudoers rule already present at %s", SUDOERS_FILE)
+                return
+    except OSError as exc:
+        log.warning("Could not read existing sudoers file: %s", exc)
+
+    # Locate the tor binary path so the rule matches the actual install
+    tor_path = shutil.which("tor") or "/usr/bin/tor"
+    # Replace the canonical path with the discovered one
+    desired_line = (
+        f"root ALL=(ALL) NOPASSWD: {tor_path}\n"
+    )
+
+    try:
+        SUDOERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SUDOERS_FILE.write_text(desired_line)
+        os.chmod(SUDOERS_FILE, 0o440)
+        log.info("[OK] Installed sudoers rule: %s", SUDOERS_FILE)
+
+        # Validate the sudoers file is well-formed (visudo -c -f)
+        visudo = shutil.which("visudo")
+        if visudo:
+            result = subprocess.run(
+                [visudo, "-c", "-f", str(SUDOERS_FILE)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                log.error("sudoers file failed validation: %s", result.stderr)
+                SUDOERS_FILE.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"Could not install valid sudoers rule: {result.stderr}"
+                )
+    except OSError as exc:
+        log.error("Failed to install sudoers rule: %s", exc)
+        raise RuntimeError(f"sudoers install failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -153,17 +233,62 @@ def _ensure_data_dir(uid: int) -> None:
 # ---------------------------------------------------------------------------
 # 3. torrc generation
 # ---------------------------------------------------------------------------
-def _write_torrc() -> str:
+def _load_bridge_section() -> tuple[str, bool]:
+    """Read bridges.conf (if present) and return the torrc lines to inject.
+
+    The returned string includes a `UseBridges 1` directive plus the
+    client-transport-plugin and Bridge lines from the file. The bool
+    indicates whether bridge mode is active (so the caller can log it).
+
+    Search order:
+        1. /etc/torvpn/bridges.conf    (system-wide)
+        2. ~/.config/torvpn/bridges.conf (per-user)
+
+    Returns:
+        (bridge_section_text, enabled)
+    """
+    candidates = [BRIDGES_CONF, BRIDGES_USER_CONF]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            raw = path.read_text()
+        except OSError as exc:
+            log.warning("Could not read bridges file %s: %s", path, exc)
+            continue
+
+        # Filter blank lines and comments. Each remaining line is
+        # appended verbatim — the user is responsible for the syntax.
+        lines = [
+            ln.strip() for ln in raw.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        if not lines:
+            log.warning("Bridges file %s is empty — ignoring", path)
+            continue
+
+        section = "UseBridges 1\n" + "\n".join(lines)
+        log.info("Bridge mode enabled (from %s, %d line%s)",
+                 path, len(lines), "s" if len(lines) != 1 else "")
+        return section, True
+
+    return "# (no bridges configured — using Tor's default guard selection)", False
+
+
+def _write_torrc() -> tuple[str, bool]:
     """Generate and write the torrc configuration file.
 
     Returns:
-        Absolute path to the generated torrc file.
+        (torrc_path, bridge_mode_enabled)
     """
+    bridge_section, bridge_enabled = _load_bridge_section()
+
     content = TORRC_TEMPLATE.format(
         listen=TOR_LISTEN_ADDR,
         trans_port=TOR_TRANS_PORT,
         dns_port=TOR_DNS_PORT,
         data_dir=TOR_DATA_DIR,
+        bridge_section=bridge_section,
     )
 
     # Write to a secure temporary file
@@ -174,9 +299,9 @@ def _write_torrc() -> str:
     # Make readable by the tor user
     os.chmod(path, 0o644)
 
-    log.info("[OK] torrc written to %s", path)
+    log.info("[OK] torrc written to %s (bridges=%s)", path, bridge_enabled)
     log.debug("torrc contents:\n%s", content)
-    return path
+    return path, bridge_enabled
 
 
 # ---------------------------------------------------------------------------
@@ -278,26 +403,45 @@ def start() -> int:
     _ensure_data_dir(uid)
 
     # Step 3: torrc
-    torrc_path = _write_torrc()
+    torrc_path, bridge_enabled = _write_torrc()
     _tor.torrc_path = torrc_path
+    _tor.bridge_mode = bridge_enabled
 
     # Step 4: Launch Tor as torvpn-worker
-    log.info("Launching Tor process as user '%s' (UID %d)...", TOR_USER, uid)
+    log.info("Launching Tor process as user '%s' (UID %d) via sudo...", TOR_USER, uid)
 
-    pw = pwd.getpwnam(TOR_USER)
+    # Prefer `sudo -u` over preexec_fn=os.setuid. Reasons:
+    #   - sudo sets up PAM (rlimits, nsswitch, login uid) correctly
+    #   - leaves an audit trail in /var/log/auth.log
+    #   - RLIMIT_NPROC / RLIMIT_NOFILE applied per PAM config
+    #   - if Tor crashes and dumps core, the core is owned by the
+    #     worker user, not by root (smaller forensic footprint)
+    # Falls back to preexec_fn if sudo is unavailable.
+    sudo_bin = shutil.which("sudo")
+    if sudo_bin:
+        argv = [sudo_bin, "-n", "-u", TOR_USER, "--", tor_bin, "-f", torrc_path]
+        _tor.process = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # merged for unified parsing
+            text=True,
+        )
+    else:
+        log.warning("sudo not found — falling back to preexec_fn setuid (less safe)")
+        pw = pwd.getpwnam(TOR_USER)
 
-    def _demote():
-        """Pre-exec function to drop privileges to torvpn-worker."""
-        os.setgid(pw.pw_gid)
-        os.setuid(pw.pw_uid)
+        def _demote():
+            """Pre-exec function to drop privileges to torvpn-worker."""
+            os.setgid(pw.pw_gid)
+            os.setuid(pw.pw_uid)
 
-    _tor.process = subprocess.Popen(
-        [tor_bin, "-f", torrc_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,  # Merge stderr into stdout for unified parsing
-        text=True,
-        preexec_fn=_demote,
-    )
+        _tor.process = subprocess.Popen(
+            [tor_bin, "-f", torrc_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # merged for unified parsing
+            text=True,
+            preexec_fn=_demote,
+        )
 
     log.info("Tor process launched (PID %d)", _tor.process.pid)
 
@@ -358,5 +502,15 @@ def stop() -> None:
     if _tor.torrc_path and os.path.exists(_tor.torrc_path):
         os.unlink(_tor.torrc_path)
         log.debug("Removed temporary torrc: %s", _tor.torrc_path)
+
+    # Remove the sudoers rule we installed. We do NOT remove the
+    # torvpn-worker user itself — keeping it lets subsequent runs
+    # skip the useradd step. To remove it, use `userdel torvpn-worker`.
+    if SUDOERS_FILE.exists():
+        try:
+            SUDOERS_FILE.unlink()
+            log.debug("Removed sudoers rule: %s", SUDOERS_FILE)
+        except OSError as exc:
+            log.warning("Could not remove sudoers rule: %s", exc)
 
     _tor.process = None

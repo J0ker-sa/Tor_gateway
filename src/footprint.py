@@ -143,6 +143,16 @@ def spoof_mac() -> None:
 
     The brief connectivity interruption is intentional — it guarantees
     no packet ever leaves with the real hardware MAC.
+
+    On wireless interfaces, MAC spoofing is skipped with a CRITICAL
+    warning rather than a silent return — the user MUST know their
+    real MAC is being broadcast, otherwise anonymity is silently
+    broken. Two environment variables can override this behavior:
+
+        TORVPN_FORCE_MAC_SPOOF=1  — spoof the wireless MAC anyway
+                                     (will break the Wi-Fi association)
+        TORVPN_ABORT_ON_WIFI=1    — raise RuntimeError if Wi-Fi is
+                                     detected (fail-fast)
     """
     iface = _detect_interface()
     original_mac = _get_current_mac(iface)
@@ -150,12 +160,45 @@ def spoof_mac() -> None:
     _state.interface = iface
     _state.mac_address = original_mac
 
-    # Changing the MAC of an authenticated Wi-Fi connection breaks WPA/WPA2.
-    # The access point will drop all traffic from the new MAC.
     is_wireless = iface.startswith("wl") or os.path.exists(f"/sys/class/net/{iface}/wireless")
+
     if is_wireless:
-        log.warning("Skipping MAC spoofing on wireless interface '%s' (would break Wi-Fi authentication)", iface)
-        return
+        # Decide how to handle wireless.
+        if os.environ.get("TORVPN_ABORT_ON_WIFI") == "1":
+            log.critical("=" * 60)
+            log.critical("WIRELESS INTERFACE DETECTED: %s", iface)
+            log.critical("Aborting per TORVPN_ABORT_ON_WIFI=1", )
+            log.critical("=" * 60)
+            raise RuntimeError(
+                f"Refusing to run on wireless interface {iface} "
+                "(TORVPN_ABORT_ON_WIFI=1)"
+            )
+
+        if os.environ.get("TORVPN_FORCE_MAC_SPOOF") != "1":
+            # Loud, non-silent warning. Print a banner the user
+            # cannot miss in their scrollback.
+            log.critical("=" * 70)
+            log.critical("!!  WIRELESS INTERFACE — MAC SPOOFING SKIPPED          !!")
+            log.critical("!!                                                      !!")
+            log.critical("!!  Detected: %s", iface.ljust(42) + "!!")
+            log.critical("!!  Real MAC still in use: %s", original_mac.ljust(27) + "!!")
+            log.critical("!!                                                      !!")
+            log.critical("!!  Your hardware MAC is being broadcast to every AP   !!")
+            log.critical("!!  you connect to. This DE-ANONYMIZES you.            !!")
+            log.critical("!!                                                      !!")
+            log.critical("!!  To force spoofing (will break Wi-Fi):              !!")
+            log.critical("!!    export TORVPN_FORCE_MAC_SPOOF=1                  !!")
+            log.critical("!!                                                      !!")
+            log.critical("!!  To abort instead of continuing:                    !!")
+            log.critical("!!    export TORVPN_ABORT_ON_WIFI=1                    !!")
+            log.critical("=" * 70)
+            return
+
+        # User explicitly forced the spoof — proceed but warn.
+        log.warning(
+            "TORVPN_FORCE_MAC_SPOOF=1: spoofing wireless MAC %s (Wi-Fi will drop)",
+            iface,
+        )
 
     new_mac = _generate_random_mac()
     log.info("Spoofing MAC on %s: %s → %s", iface, original_mac, new_mac)

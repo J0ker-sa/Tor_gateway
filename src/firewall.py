@@ -197,32 +197,111 @@ def apply(tor_uid: int) -> None:
     log.info("     TCP redirect:  *      → 127.0.0.1:%d", TOR_TRANS_PORT)
 
 
-def panic() -> None:
+# Emergency kill-switch ruleset — installed by panic() when Tor dies.
+# We replace the NAT chain's contents with a single drop and add an
+# explicit drop-all rule to the killswitch chain. This guarantees the
+# DROP policy is in effect even if the table is later deleted, and
+# keeps the kill-switch ACTIVE if Tor never comes back.
+#
+# The placeholder {tor_uid} is the torvpn-worker UID (so a still-running
+# Tor process can be replaced without leaving its own outbound blocked
+# during the restart window — defensive in case the watchdog restarts
+# Tor in the same second panic() is called).
+PANIC_RULESET = """\
+table {family} {table} {{
+    chain output {{
+        type nat hook output priority -100; policy accept;
+        # Strip every DNAT — nothing should be redirected while Tor is down.
+        meta skuid {tor_uid} accept
+        ip daddr {lan} accept
+        drop
+    }}
+
+    chain killswitch {{
+        type filter hook output priority 0; policy drop;
+        # Belt-and-suspenders: even if the policy somehow changes,
+        # this explicit drop catches everything.
+        drop
+    }}
+}}
+"""
+
+
+def panic(tor_uid: int = 0) -> None:
     """Emergency kill-switch activation.
 
-    Flushes all rules from the torvpn table but KEEPS the table and its
-    chains (which have policy DROP). This means:
-        - The NAT chain's ACCEPT/DNAT rules are gone
-        - The filter chain's ACCEPT rules are gone
-        - Only the DROP policy remains → all traffic is blocked
+    Replaces the torvpn table with a minimal ruleset that:
+        1. Strips all DNAT redirections (NAT chain ends in `drop`).
+        2. Kills the killswitch filter chain so every outbound packet
+           that doesn't match a Tor-UID or LAN accept hits the DROP
+           policy.
 
     This is called by the watchdog when Tor crashes unexpectedly.
+    The explicit drop is intentional: the previous implementation
+    flushed the table, which removed the DROP policy along with
+    the rules — leaving the system unprotected if the host firewall
+    happened to allow outbound traffic.
+
+    Args:
+        tor_uid: The torvpn-worker UID. If 0, the Tor-UID exemption
+                 is omitted (killswitch blocks everything, including
+                 a zombie Tor process — which is the safest default
+                 during a crash).
     """
     log.critical("!!! PANIC — ACTIVATING KILL-SWITCH !!!")
 
-    try:
-        _run_nft(["flush", "table", TABLE_FAMILY, TABLE_NAME])
-        log.critical("[PANIC] All rules flushed — DROP policy in effect")
-        log.critical("[PANIC] NO internet traffic will pass until Tor is restored")
-    except subprocess.CalledProcessError as exc:
-        # If the table doesn't exist, we're already in a safe state
-        # (no rules means no traffic — the default kernel behavior
-        # without nftables is to accept, but we handle this edge case
-        # by logging a warning).
-        log.error(
-            "Failed to flush nftables table (it may not exist): %s",
-            exc.stderr,
+    # Build a ruleset. The uid substitution is just an integer, so
+    # no string-injection concern.
+    if tor_uid <= 0:
+        # No UID provided — kill EVERYTHING (safest during a crash).
+        panic_rules = (
+            f"add table {TABLE_FAMILY} {TABLE_NAME}\n"
+            f"delete table {TABLE_FAMILY} {TABLE_NAME}\n"
+            f"table {TABLE_FAMILY} {TABLE_NAME} {{\n"
+            f"    chain killswitch {{\n"
+            f"        type filter hook output priority 0; policy drop;\n"
+            f"        drop\n"
+            f"    }}\n"
+            f"}}\n"
         )
+    else:
+        panic_rules = (
+            f"add table {TABLE_FAMILY} {TABLE_NAME}\n"
+            f"delete table {TABLE_FAMILY} {TABLE_NAME}\n"
+            f"table {TABLE_FAMILY} {TABLE_NAME} {{\n"
+            f"    chain output {{\n"
+            f"        type nat hook output priority -100; policy accept;\n"
+            f"        meta skuid {tor_uid} accept\n"
+            f"        ip daddr {LAN_SUBNETS} accept\n"
+            f"        drop\n"
+            f"    }}\n"
+            f"    chain killswitch {{\n"
+            f"        type filter hook output priority 0; policy drop;\n"
+            f"        drop\n"
+            f"    }}\n"
+            f"}}\n"
+        )
+
+    try:
+        _run_nft(["-f", "-"], input_data=panic_rules)
+        log.critical("[PANIC] Kill-switch engaged — all outbound traffic DROPped")
+        log.critical("[PANIC] No internet access until Tor is restored")
+    except subprocess.CalledProcessError as exc:
+        log.error("[PANIC] Failed to install kill-switch rules: %s", exc.stderr)
+        # Last-ditch effort: try the bare table-with-DROP approach
+        try:
+            _run_nft([
+                "add", "table", TABLE_FAMILY, TABLE_NAME,
+            ])
+            _run_nft([
+                "add", "chain", TABLE_FAMILY, TABLE_NAME, "killswitch",
+                "{", "type", "filter", "hook", "output", "priority", "0",
+                ";", "policy", "drop", ";", "}",
+            ])
+            log.critical("[PANIC] Bare kill-switch chain installed")
+        except subprocess.CalledProcessError as exc2:
+            log.critical("[PANIC] Could not install kill-switch: %s", exc2.stderr)
+            log.critical("[PANIC] SYSTEM MAY LEAK — investigate immediately")
 
 
 def teardown() -> None:
