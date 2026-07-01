@@ -458,8 +458,14 @@ def start(bootstrap_timeout: int = DEFAULT_BOOTSTRAP_TIMEOUT) -> int:
     _tor.uid = uid
 
     # Step 1.5: Clean up any orphaned Tor processes from previous runs
-    log.info("Cleaning up any orphaned Tor processes...")
+    log.info("Cleaning up any orphaned Tor processes or rogue listeners...")
     subprocess.run(["pkill", "-9", "-u", TOR_USER, "-x", "tor"], check=False)
+    
+    # Aggressively free up our required ports in case another user/process is holding them
+    if shutil.which("fuser"):
+        subprocess.run(["fuser", "-k", "-9", f"{TOR_TRANS_PORT}/tcp"], check=False, capture_output=True)
+        subprocess.run(["fuser", "-k", "-9", f"{TOR_DNS_PORT}/udp"], check=False, capture_output=True)
+
     time.sleep(0.5)  # Give the OS a moment to release the sockets
 
     # Step 2: Data directory
