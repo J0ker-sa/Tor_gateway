@@ -48,6 +48,9 @@ TABLE_FAMILY = "inet"
 LAN_SUBNETS_NFT = "{ 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }"
 LAN_SUBNETS_LIST = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 
+LAN6_SUBNETS_NFT = "{ ::1/128, fe80::/10, fc00::/7 }"
+LAN6_SUBNETS_LIST = ["::1/128", "fe80::/10", "fc00::/7"]
+
 # Tor ports (must match the torrc configuration)
 TOR_TRANS_PORT = 9040
 TOR_DNS_PORT = 9053
@@ -55,6 +58,7 @@ TOR_DNS_PORT = 9053
 # Detected backend — set by _detect_backend()
 _backend: Optional[str] = None      # "nft" or "iptables"
 _iptables_bin: Optional[str] = None  # path to iptables/iptables-legacy
+_ip6tables_bin: Optional[str] = None # path to ip6tables/ip6tables-legacy
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +79,7 @@ def _detect_backend() -> str:
     Side effects:
         Sets module-level ``_backend`` and ``_iptables_bin``.
     """
-    global _backend, _iptables_bin
+    global _backend, _iptables_bin, _ip6tables_bin
 
     # Try nft first (preferred)
     if shutil.which("nft"):
@@ -88,6 +92,7 @@ def _detect_backend() -> str:
     if legacy:
         _backend = "iptables"
         _iptables_bin = legacy
+        _ip6tables_bin = shutil.which("ip6tables-legacy") or shutil.which("ip6tables")
         log.info("Firewall backend: iptables-legacy (%s)", legacy)
         return "iptables"
 
@@ -96,6 +101,7 @@ def _detect_backend() -> str:
     if ipt:
         _backend = "iptables"
         _iptables_bin = ipt
+        _ip6tables_bin = shutil.which("ip6tables")
         log.info("Firewall backend: iptables (%s)", ipt)
         return "iptables"
 
@@ -145,6 +151,7 @@ table {family} {table} {{
         # Rule 2: LAN traffic is exempt from redirection.
         # This preserves local SSH, file sharing, printer access, etc.
         ip daddr {lan} accept
+        ip6 daddr {lan6} accept
 
         # Rule 3: Redirect all DNS queries (UDP/53) to Tor's DNS resolver.
         # This prevents DNS leaks to the ISP's resolver.
@@ -173,6 +180,7 @@ table {family} {table} {{
 
         # Allow LAN traffic (same subnets as NAT exemption).
         ip daddr {lan} accept
+        ip6 daddr {lan6} accept
 
         # Allow established and related connections.
         # This is critical: after DNAT rewrites the destination to
@@ -228,6 +236,7 @@ def _generate_nftables_ruleset(tor_uid: int) -> str:
         table=TABLE_NAME,
         tor_uid=tor_uid,
         lan=LAN_SUBNETS_NFT,
+        lan6=LAN6_SUBNETS_NFT,
         trans_port=TOR_TRANS_PORT,
         dns_port=TOR_DNS_PORT,
     )
@@ -320,14 +329,11 @@ def _panic_nftables(tor_uid: int) -> None:
             f"add table {TABLE_FAMILY} {TABLE_NAME}\n"
             f"delete table {TABLE_FAMILY} {TABLE_NAME}\n"
             f"table {TABLE_FAMILY} {TABLE_NAME} {{\n"
-            f"    chain output {{\n"
-            f"        type nat hook output priority -100; policy accept;\n"
-            f"        meta skuid {tor_uid} accept\n"
-            f"        ip daddr {LAN_SUBNETS_NFT} accept\n"
-            f"        drop\n"
-            f"    }}\n"
             f"    chain killswitch {{\n"
             f"        type filter hook output priority 0; policy drop;\n"
+            f"        meta skuid {tor_uid} accept\n"
+            f"        ip daddr {LAN_SUBNETS_NFT} accept\n"
+            f"        ip6 daddr {LAN6_SUBNETS_NFT} accept\n"
             f"        drop\n"
             f"    }}\n"
             f"}}\n"
@@ -356,7 +362,7 @@ def _panic_nftables(tor_uid: int) -> None:
 # IPTABLES BACKEND (Legacy Fallback)
 # ===========================================================================
 
-def _run_ipt(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
+def _run_ipt(args: list[str], *, check: bool = True, is_ip6: bool = False) -> subprocess.CompletedProcess:
     """Execute an iptables command with error handling.
 
     Uses the detected iptables binary (``iptables`` or ``iptables-legacy``).
@@ -364,14 +370,20 @@ def _run_ipt(args: list[str], *, check: bool = True) -> subprocess.CompletedProc
     Args:
         args:  Arguments to pass after the iptables binary.
         check: Raise on non-zero exit.
+        is_ip6: If True, run ip6tables instead of iptables.
 
     Returns:
         CompletedProcess instance.
     """
-    if _iptables_bin is None:
-        raise RuntimeError("iptables binary not detected — call _detect_backend() first")
+    bin_path = _ip6tables_bin if is_ip6 else _iptables_bin
+    if bin_path is None:
+        if is_ip6:
+             log.debug("ip6tables binary not found, skipping IPv6 rule.")
+             return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        else:
+             raise RuntimeError("iptables binary not detected — call _detect_backend() first")
 
-    cmd = [_iptables_bin] + args
+    cmd = [bin_path] + args
     log.debug("exec: %s", " ".join(cmd))
     try:
         return subprocess.run(
@@ -485,6 +497,18 @@ def generate_iptables_commands(tor_uid: int) -> list[str]:
     commands.append(f"{ipt} -t nat -A OUTPUT -j TORVPN_NAT")
     commands.append(f"{ipt} -A OUTPUT -j TORVPN_KILL")
 
+    # ── IPv6 Anti-Leak (ip6tables) ──
+    if _ip6tables_bin:
+        ip6t = "ip6tables"  # Placeholder string, actual execution uses is_ip6 flag
+        commands.append(f"{ip6t} -t filter -N TORVPN_KILL 2>/dev/null || true")
+        commands.append(f"{ip6t} -t filter -F TORVPN_KILL")
+        commands.append(f"{ip6t} -A TORVPN_KILL -o lo -j ACCEPT")
+        commands.append(f"{ip6t} -A TORVPN_KILL -m owner --uid-owner {tor_uid} -j ACCEPT")
+        for subnet in LAN6_SUBNETS_LIST:
+            commands.append(f"{ip6t} -A TORVPN_KILL -d {subnet} -j ACCEPT")
+        commands.append(f"{ip6t} -A TORVPN_KILL -j DROP")
+        commands.append(f"{ip6t} -A OUTPUT -j TORVPN_KILL")
+
     return commands
 
 
@@ -510,7 +534,8 @@ def _apply_iptables(tor_uid: int) -> None:
         # Strip shell redirects and boolean operators.
         clean_parts = [p for p in parts if p not in ("||", "true", "2>/dev/null")]
 
-        _run_ipt(clean_parts[1:], check=check)  # [1:] strips the binary name
+        is_ip6 = clean_parts[0] == "ip6tables"
+        _run_ipt(clean_parts[1:], check=check, is_ip6=is_ip6)  # [1:] strips the binary name
 
     log.info("[OK] iptables ruleset applied (kill-switch active)")
     log.info("     Tor UID exemption: %d", tor_uid)
@@ -532,6 +557,11 @@ def _teardown_iptables() -> None:
     _run_ipt(["-F", "TORVPN_KILL"], check=False)
     _run_ipt(["-X", "TORVPN_KILL"], check=False)
 
+    if _ip6tables_bin:
+        _run_ipt(["-D", "OUTPUT", "-j", "TORVPN_KILL"], check=False, is_ip6=True)
+        _run_ipt(["-F", "TORVPN_KILL"], check=False, is_ip6=True)
+        _run_ipt(["-X", "TORVPN_KILL"], check=False, is_ip6=True)
+
     log.info("[OK] iptables rules removed — firewall restored")
 
 
@@ -550,6 +580,12 @@ def _panic_iptables(tor_uid: int) -> None:
 
     # Re-add the jump.
     _run_ipt(["-A", "OUTPUT", "-j", "TORVPN_KILL"], check=False)
+
+    if _ip6tables_bin:
+        _run_ipt(["-D", "OUTPUT", "-j", "TORVPN_KILL"], check=False, is_ip6=True)
+        _run_ipt(["-F", "TORVPN_KILL"], check=False, is_ip6=True)
+        _run_ipt(["-A", "TORVPN_KILL", "-j", "DROP"], check=False, is_ip6=True)
+        _run_ipt(["-A", "OUTPUT", "-j", "TORVPN_KILL"], check=False, is_ip6=True)
 
     log.critical("[PANIC] iptables kill-switch engaged — all outbound DROPped")
 
