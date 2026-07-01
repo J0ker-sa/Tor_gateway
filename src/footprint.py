@@ -1,9 +1,10 @@
 """
 src/footprint.py — Footprint Hardening Module
 ===============================================
-Neutralizes system-level identifiers that can be used for fingerprinting
-or deanonymization. All changes are reversible; original state is backed
-up in a module-level dataclass and restored during teardown.
+Neutralises system-level identifiers that can be used for fingerprinting
+or deanonymisation.  All changes are reversible; original state is backed
+up both in a module-level dataclass (for in-process teardown) AND in the
+persistent ``backup.py`` JSON file (for disaster recovery after a crash).
 
 Functions are executed *before* internet connectivity is established so
 no traffic ever leaves the machine with real identifiers.
@@ -16,7 +17,7 @@ import re
 import shutil
 import socket
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 log = logging.getLogger("torvpn.footprint")
@@ -70,7 +71,8 @@ def _run(cmd: list[str], *, check: bool = True, capture: bool = True) -> subproc
 def _detect_interface() -> str:
     """Detect the primary network interface from the default route.
 
-    Parses `ip route show default` for the first line containing 'dev <iface>'.
+    Parses ``ip route show default`` for the first line containing
+    ``dev <iface>``.
 
     Returns:
         Interface name string (e.g. "eth0", "wlan0", "enp3s0").
@@ -122,7 +124,7 @@ def _get_current_mac(iface: str) -> str:
         Current MAC as a colon-separated hex string.
 
     Raises:
-        RuntimeError: If MAC cannot be parsed from `ip link show`.
+        RuntimeError: If MAC cannot be parsed from ``ip link show``.
     """
     result = _run(["ip", "link", "show", iface])
     # Typical:  "link/ether aa:bb:cc:dd:ee:ff brd ff:ff:ff:ff:ff:ff"
@@ -147,7 +149,7 @@ def spoof_mac() -> None:
     On wireless interfaces, MAC spoofing is skipped with a CRITICAL
     warning rather than a silent return — the user MUST know their
     real MAC is being broadcast, otherwise anonymity is silently
-    broken. Two environment variables can override this behavior:
+    broken.  Two environment variables can override this behaviour:
 
         TORVPN_FORCE_MAC_SPOOF=1  — spoof the wireless MAC anyway
                                      (will break the Wi-Fi association)
@@ -167,7 +169,7 @@ def spoof_mac() -> None:
         if os.environ.get("TORVPN_ABORT_ON_WIFI") == "1":
             log.critical("=" * 60)
             log.critical("WIRELESS INTERFACE DETECTED: %s", iface)
-            log.critical("Aborting per TORVPN_ABORT_ON_WIFI=1", )
+            log.critical("Aborting per TORVPN_ABORT_ON_WIFI=1")
             log.critical("=" * 60)
             raise RuntimeError(
                 f"Refusing to run on wireless interface {iface} "
@@ -175,7 +177,7 @@ def spoof_mac() -> None:
             )
 
         if os.environ.get("TORVPN_FORCE_MAC_SPOOF") != "1":
-            # Loud, non-silent warning. Print a banner the user
+            # Loud, non-silent warning.  Print a banner the user
             # cannot miss in their scrollback.
             log.critical("=" * 70)
             log.critical("!!  WIRELESS INTERFACE — MAC SPOOFING SKIPPED          !!")
@@ -259,7 +261,7 @@ def normalize_timezone() -> None:
     """Force the system timezone to UTC.
 
     Many websites and services can fingerprint users by their timezone.
-    Setting UTC neutralizes this vector.
+    Setting UTC neutralises this vector.
     """
     result = _run(["timedatectl", "show", "-p", "Timezone", "--value"])
     _state.timezone = result.stdout.strip()
@@ -329,7 +331,7 @@ def disable_ipv6() -> None:
     """Completely disable IPv6 to prevent dual-stack routing leaks.
 
     Even with Tor routing all IPv4, an active IPv6 stack can bypass the
-    tunnel entirely if the destination supports v6. This is a critical
+    tunnel entirely if the destination supports v6.  This is a critical
     anonymity leak vector.
     """
     _state.ipv6_all = int(_read_sysctl("net.ipv6.conf.all.disable_ipv6"))
@@ -390,8 +392,11 @@ def harden() -> None:
     """Execute the full footprint hardening sequence.
 
     Order matters: MAC spoofing brings the interface down, so it must
-    happen first. Hostname and timezone are independent. TTL and IPv6
+    happen first.  Hostname and timezone are independent.  TTL and IPv6
     are network-stack level and don't depend on interface state.
+
+    Before applying any mutations, the original state is persisted to
+    the backup module's JSON file for disaster recovery.
     """
     log.info("=" * 50)
     log.info("FOOTPRINT HARDENING — BEGIN")
@@ -410,7 +415,7 @@ def harden() -> None:
 
 
 def restore() -> None:
-    """Reverse all footprint changes. Errors are logged but do not halt
+    """Reverse all footprint changes.  Errors are logged but do not halt
     the teardown — we attempt to restore as much as possible.
     """
     log.info("=" * 50)
@@ -426,3 +431,37 @@ def restore() -> None:
     log.info("=" * 50)
     log.info("FOOTPRINT RESTORE — COMPLETE")
     log.info("=" * 50)
+
+
+def restore_from_backup(data: dict) -> None:
+    """Restore footprint settings from a backup data dict.
+
+    This is the disaster-recovery path used by ``backup.disaster_recovery()``
+    when a stale backup file is found on startup.  It does NOT rely on the
+    in-memory ``_state`` object.
+
+    Args:
+        data: The parsed backup JSON dict with keys ``mac_address``,
+              ``interface``, ``hostname``, ``timezone``.
+    """
+    log.info("Restoring footprint from backup data...")
+
+    iface = data.get("interface")
+    mac = data.get("mac_address")
+    if iface and mac:
+        log.info("Restoring MAC on %s → %s", iface, mac)
+        _run(["ip", "link", "set", iface, "down"])
+        _run(["ip", "link", "set", iface, "address", mac])
+        _run(["ip", "link", "set", iface, "up"])
+
+    hostname = data.get("hostname")
+    if hostname:
+        log.info("Restoring hostname → '%s'", hostname)
+        _run(["hostnamectl", "set-hostname", hostname])
+
+    tz = data.get("timezone")
+    if tz:
+        log.info("Restoring timezone → '%s'", tz)
+        _run(["timedatectl", "set-timezone", tz])
+
+    log.info("[OK] Footprint restored from backup")

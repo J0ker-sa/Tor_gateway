@@ -4,13 +4,12 @@ src/dns.py — DNS Namespace Controller
 Manages /etc/resolv.conf to force all DNS resolution through Tor's
 local DNS resolver (127.0.0.1:9053).
 
-The critical operation here is the `chattr +i` immutable flag, which
+The critical operation here is the ``chattr +i`` immutable flag, which
 prevents NetworkManager, systemd-resolved, and DHCP clients from
 overwriting our locked configuration while the VPN is active.
 """
 
 import logging
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -161,3 +160,32 @@ def restore() -> None:
         )
 
     log.info("[OK] DNS resolver unlocked")
+
+
+def restore_from_backup(original_resolv_content: str) -> None:
+    """Restore resolv.conf from a backup data string.
+
+    This is the disaster-recovery path used by ``backup.disaster_recovery()``
+    when a stale backup file is found on startup.  It does NOT rely on the
+    sidecar ``.torvpn.bak`` file or the module-level ``_backup_created`` flag.
+
+    Sequence:
+        1. Remove immutable flag (may have been set by a previous lock()).
+        2. Write the original content back to /etc/resolv.conf.
+
+    Args:
+        original_resolv_content: The original resolv.conf file contents
+                                 as stored in the persistent JSON backup.
+    """
+    log.info("Restoring resolv.conf from persistent backup data...")
+
+    # Step 1: Remove immutable flag
+    try:
+        _chattr("-i")
+        log.debug("Cleared immutable flag for disaster recovery")
+    except subprocess.CalledProcessError:
+        log.debug("No immutable flag to clear")
+
+    # Step 2: Write original content
+    RESOLV_CONF.write_text(original_resolv_content)
+    log.info("[OK] resolv.conf restored from backup data")

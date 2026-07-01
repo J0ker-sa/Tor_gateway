@@ -5,7 +5,7 @@ Handles the complete lifecycle of a dedicated Tor daemon instance:
     1. System user creation (torvpn-worker)
     2. Data directory provisioning
     3. torrc configuration generation
-    4. Process launch and bootstrap monitoring
+    4. Process launch and bootstrap monitoring with heartbeat
     5. Health checking and graceful termination
 
 The Tor daemon runs as a subprocess owned by Python (RunAsDaemon 0),
@@ -18,11 +18,14 @@ import pwd
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Optional
+
+from src.exitcodes import ExitCode
 
 log = logging.getLogger("torvpn.tor")
 
@@ -34,7 +37,11 @@ TOR_DATA_DIR = Path("/var/lib/torvpn")
 TOR_TRANS_PORT = 9040
 TOR_DNS_PORT = 9053
 TOR_LISTEN_ADDR = "127.0.0.1"
-BOOTSTRAP_TIMEOUT = 120  # seconds to wait for 100% bootstrap
+
+# Default bootstrap timeout — overridden by config.bootstrap_timeout at
+# runtime.  This constant exists only as a fallback for direct module
+# usage outside the orchestrator.
+DEFAULT_BOOTSTRAP_TIMEOUT = 300  # seconds
 
 # Paths searched (in order) for the optional bridges configuration.
 # If any of these files exist, bridge mode is enabled automatically.
@@ -42,10 +49,10 @@ BOOTSTRAP_TIMEOUT = 120  # seconds to wait for 100% bootstrap
 BRIDGES_CONF = Path("/etc/torvpn/bridges.conf")
 BRIDGES_USER_CONF = Path.home() / ".config" / "torvpn" / "bridges.conf"
 
-# Base torrc — no bridges. Bridge lines are appended if a bridges.conf
-# is found. The {bridge_section} placeholder is replaced with either
+# Base torrc — no bridges.  Bridge lines are appended if a bridges.conf
+# is found.  The {bridge_section} placeholder is replaced with either
 # the bridge directives (UseBridges 1 + ClientTransportPlugin + Bridge
-# lines) or the string `# (no bridges configured)` so Tor uses its
+# lines) or the string ``# (no bridges configured)`` so Tor uses its
 # default guard selection.
 TORRC_TEMPLATE = """\
 ## Auto-generated torrc for torvpn — do not edit manually.
@@ -87,6 +94,7 @@ class _TorState:
         self.torrc_path: Optional[str] = None
         self.uid: Optional[int] = None
         self._reader_thread: Optional[threading.Thread] = None
+        self._heartbeat_thread: Optional[threading.Thread] = None
         self._bootstrapped = threading.Event()
         self._bootstrap_pct: int = 0
         self._output_lines: list[str] = []
@@ -107,9 +115,9 @@ def _ensure_user() -> int:
         - No home directory
         - System account flag (low UID range)
 
-    Also installs a sudoers rule allowing root to run `tor` as
-    `torvpn-worker` non-interactively (NOPASSWD). This is required by
-    fix #3 — running Tor via `sudo -u` rather than `preexec_fn=os.setuid`.
+    Also installs a sudoers rule allowing root to run ``tor`` as
+    ``torvpn-worker`` non-interactively (NOPASSWD).  This is required by
+    the ``sudo -u`` launch strategy.
 
     Returns:
         The numeric UID of the torvpn-worker user.
@@ -151,23 +159,18 @@ def _ensure_user() -> int:
     return uid
 
 
-# Sudoers file granting root the right to run `tor` as torvpn-worker
-# without a password. This is required by fix #3.
+# Sudoers file granting root the right to run ``tor`` as torvpn-worker
+# without a password.
 SUDOERS_FILE = Path("/etc/sudoers.d/torvpn-tor")
 
 
 def _ensure_sudoers_rule(uid: int) -> None:
-    """Install /etc/sudoers.d/torvpn-tor with NOPASSWD for `tor`.
+    """Install /etc/sudoers.d/torvpn-tor with NOPASSWD for ``tor``.
 
     Idempotent: writes only if the file does not already contain the
-    correct line. The rule is scoped to a single binary (tor) and a
+    correct line.  The rule is scoped to a single binary (tor) and a
     single target user (torvpn-worker) — no broader access is granted.
     """
-    desired_line = (
-        f"root ALL=(ALL) NOPASSWD: /usr/bin/tor, /usr/sbin/tor, /usr/local/bin/tor, "
-        f"/usr/local/sbin/tor, /bin/tor, /sbin/tor\n"
-    )
-
     try:
         if SUDOERS_FILE.exists():
             existing = SUDOERS_FILE.read_text()
@@ -179,10 +182,7 @@ def _ensure_sudoers_rule(uid: int) -> None:
 
     # Locate the tor binary path so the rule matches the actual install
     tor_path = shutil.which("tor") or "/usr/bin/tor"
-    # Replace the canonical path with the discovered one
-    desired_line = (
-        f"root ALL=(ALL) NOPASSWD: {tor_path}\n"
-    )
+    desired_line = f"root ALL=(ALL) NOPASSWD: {tor_path}\n"
 
     try:
         SUDOERS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -236,8 +236,8 @@ def _ensure_data_dir(uid: int) -> None:
 def _load_bridge_section() -> tuple[str, bool]:
     """Read bridges.conf (if present) and return the torrc lines to inject.
 
-    The returned string includes a `UseBridges 1` directive plus the
-    client-transport-plugin and Bridge lines from the file. The bool
+    The returned string includes a ``UseBridges 1`` directive plus the
+    client-transport-plugin and Bridge lines from the file.  The bool
     indicates whether bridge mode is active (so the caller can log it).
 
     Search order:
@@ -257,7 +257,7 @@ def _load_bridge_section() -> tuple[str, bool]:
             log.warning("Could not read bridges file %s: %s", path, exc)
             continue
 
-        # Filter blank lines and comments. Each remaining line is
+        # Filter blank lines and comments.  Each remaining line is
         # appended verbatim — the user is responsible for the syntax.
         lines = [
             ln.strip() for ln in raw.splitlines()
@@ -273,6 +273,25 @@ def _load_bridge_section() -> tuple[str, bool]:
         return section, True
 
     return "# (no bridges configured — using Tor's default guard selection)", False
+
+
+def generate_torrc() -> str:
+    """Generate the torrc configuration content WITHOUT writing to disk.
+
+    This is used by the ``--dry-run`` mode to show the user what
+    configuration would be applied.
+
+    Returns:
+        The complete torrc file content as a string.
+    """
+    bridge_section, _ = _load_bridge_section()
+    return TORRC_TEMPLATE.format(
+        listen=TOR_LISTEN_ADDR,
+        trans_port=TOR_TRANS_PORT,
+        dns_port=TOR_DNS_PORT,
+        data_dir=TOR_DATA_DIR,
+        bridge_section=bridge_section,
+    )
 
 
 def _write_torrc() -> tuple[str, bool]:
@@ -345,6 +364,39 @@ def _monitor_output(process: subprocess.Popen) -> None:
         pass
 
 
+def _heartbeat_loop(timeout: int) -> None:
+    """Emit a heartbeat log message every 5 seconds during bootstrap.
+
+    Provides visible feedback to the user/operator that the bootstrap
+    process is still active, and shows elapsed time.  Stops once
+    bootstrap completes or the timeout is reached.
+
+    Args:
+        timeout: The bootstrap timeout in seconds (for display only —
+                 the actual timeout enforcement is in ``start()``).
+    """
+    start_time = time.monotonic()
+    interval = 5  # seconds between heartbeats
+
+    while not _tor._bootstrapped.is_set():
+        _tor._bootstrapped.wait(timeout=interval)
+        if _tor._bootstrapped.is_set():
+            break
+
+        elapsed = int(time.monotonic() - start_time)
+        pct = _tor._bootstrap_pct
+        log.info(
+            "[HEARTBEAT] Tor is bootstrapping... "
+            "[Elapsed: %ds / %ds] [Progress: %d%%]",
+            elapsed, timeout, pct,
+        )
+
+        # Stop heartbeat if we've exceeded the timeout (the main
+        # thread will handle the actual termination).
+        if elapsed >= timeout:
+            break
+
+
 # ---------------------------------------------------------------------------
 # 5. Public API
 # ---------------------------------------------------------------------------
@@ -364,7 +416,7 @@ def is_alive() -> bool:
     return _tor.process.poll() is None
 
 
-def start() -> int:
+def start(bootstrap_timeout: int = DEFAULT_BOOTSTRAP_TIMEOUT) -> int:
     """Execute the full Tor startup sequence.
 
     Sequence:
@@ -372,14 +424,20 @@ def start() -> int:
         2. Provision data directory.
         3. Generate torrc.
         4. Launch Tor subprocess.
-        5. Wait for 100% bootstrap.
+        5. Start heartbeat thread.
+        6. Wait for 100% bootstrap.
+
+    Args:
+        bootstrap_timeout: Maximum seconds to wait for Tor to reach
+                           100% network consensus bootstrap.
 
     Returns:
         The UID of the torvpn-worker user (needed by the firewall module).
 
     Raises:
-        RuntimeError: If Tor fails to bootstrap within the timeout.
-        FileNotFoundError: If the `tor` binary is not installed.
+        FileNotFoundError: If the ``tor`` binary is not installed.
+        SystemExit: If Tor fails to bootstrap within the timeout
+                    (exits with ``ExitCode.ERROR_TOR_BOOTSTRAP_TIMEOUT``).
     """
     log.info("=" * 50)
     log.info("TOR LIFECYCLE — STARTING")
@@ -410,7 +468,7 @@ def start() -> int:
     # Step 4: Launch Tor as torvpn-worker
     log.info("Launching Tor process as user '%s' (UID %d) via sudo...", TOR_USER, uid)
 
-    # Prefer `sudo -u` over preexec_fn=os.setuid. Reasons:
+    # Prefer ``sudo -u`` over preexec_fn=os.setuid.  Reasons:
     #   - sudo sets up PAM (rlimits, nsswitch, login uid) correctly
     #   - leaves an audit trail in /var/log/auth.log
     #   - RLIMIT_NPROC / RLIMIT_NOFILE applied per PAM config
@@ -454,16 +512,25 @@ def start() -> int:
     )
     _tor._reader_thread.start()
 
-    # Wait for bootstrap completion
-    log.info("Waiting for Tor to bootstrap (timeout=%ds)...", BOOTSTRAP_TIMEOUT)
-    if not _tor._bootstrapped.wait(timeout=BOOTSTRAP_TIMEOUT):
+    # Step 5b: Start heartbeat thread — logs progress every 5 seconds
+    _tor._heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(bootstrap_timeout,),
+        daemon=True,
+        name="tor-bootstrap-heartbeat",
+    )
+    _tor._heartbeat_thread.start()
+
+    # Step 6: Wait for bootstrap completion
+    log.info("Waiting for Tor to bootstrap (timeout=%ds)...", bootstrap_timeout)
+    if not _tor._bootstrapped.wait(timeout=bootstrap_timeout):
         # Timeout — Tor didn't reach 100%
-        log.error("Tor bootstrap timed out at %d%%", _tor._bootstrap_pct)
-        stop()
-        raise RuntimeError(
-            f"Tor failed to bootstrap within {BOOTSTRAP_TIMEOUT}s. "
-            f"Reached {_tor._bootstrap_pct}%. Check network connectivity."
+        log.critical(
+            "Tor bootstrap timed out at %d%% after %ds",
+            _tor._bootstrap_pct, bootstrap_timeout,
         )
+        stop()
+        sys.exit(ExitCode.ERROR_TOR_BOOTSTRAP_TIMEOUT)
 
     log.info("=" * 50)
     log.info("[OK] TOR FULLY BOOTSTRAPPED — 100%%")
@@ -474,7 +541,7 @@ def start() -> int:
 def stop() -> None:
     """Gracefully terminate the Tor process.
 
-    Sends SIGTERM first and waits up to 10 seconds. If the process
+    Sends SIGTERM first and waits up to 10 seconds.  If the process
     doesn't exit, escalates to SIGKILL.
     """
     if _tor.process is None:
@@ -503,9 +570,9 @@ def stop() -> None:
         os.unlink(_tor.torrc_path)
         log.debug("Removed temporary torrc: %s", _tor.torrc_path)
 
-    # Remove the sudoers rule we installed. We do NOT remove the
+    # Remove the sudoers rule we installed.  We do NOT remove the
     # torvpn-worker user itself — keeping it lets subsequent runs
-    # skip the useradd step. To remove it, use `userdel torvpn-worker`.
+    # skip the useradd step.  To remove it, use ``userdel torvpn-worker``.
     if SUDOERS_FILE.exists():
         try:
             SUDOERS_FILE.unlink()
