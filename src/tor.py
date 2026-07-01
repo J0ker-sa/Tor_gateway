@@ -457,6 +457,11 @@ def start(bootstrap_timeout: int = DEFAULT_BOOTSTRAP_TIMEOUT) -> int:
     uid = _ensure_user()
     _tor.uid = uid
 
+    # Step 1.5: Clean up any orphaned Tor processes from previous runs
+    log.info("Cleaning up any orphaned Tor processes...")
+    subprocess.run(["pkill", "-9", "-u", TOR_USER, "-x", "tor"], check=False)
+    time.sleep(0.5)  # Give the OS a moment to release the sockets
+
     # Step 2: Data directory
     _ensure_data_dir(uid)
 

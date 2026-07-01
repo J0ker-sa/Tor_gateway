@@ -95,8 +95,6 @@ curl https://check.torproject.org/api/ip
 
 > ⚠️ **Not a replacement for Tails/Whonix.** While this provides system-wide Tor routing, a dedicated OS like Tails or Whonix provides stronger isolation guarantees (e.g., separate VMs for the gateway and workstation).
 
-## License
 
-MIT
 # Tor_gateway
 # Tor_gateway
