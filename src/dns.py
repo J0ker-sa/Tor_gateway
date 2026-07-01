@@ -35,6 +35,8 @@ nameserver 127.0.0.1
 # Module state
 # ---------------------------------------------------------------------------
 _backup_created = False
+_was_symlink = False
+_symlink_target = ""
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +75,7 @@ def lock() -> None:
     the nftables rules are in place, so DNS queries to 127.0.0.1
     are actually handled by Tor's DNSPort.
     """
-    global _backup_created
+    global _backup_created, _was_symlink, _symlink_target
 
     log.info("=" * 50)
     log.info("DNS — LOCKING RESOLVER")
@@ -92,13 +94,17 @@ def lock() -> None:
         # If the file is a symlink (common with systemd-resolved),
         # we need to copy the actual content, not the symlink itself.
         if RESOLV_CONF.is_symlink():
+            _was_symlink = True
+            _symlink_target = os.readlink(str(RESOLV_CONF))
             # Read the symlink target's content and write it to the backup
             content = RESOLV_CONF.read_text()
             RESOLV_BACKUP.write_text(content)
-            log.info("Backed up resolv.conf (was symlink) → %s", RESOLV_BACKUP)
+            log.info("Backed up resolv.conf (was symlink pointing to %s) → %s", _symlink_target, RESOLV_BACKUP)
             # Remove the symlink so we can write a regular file
             RESOLV_CONF.unlink()
         else:
+            _was_symlink = False
+            _symlink_target = ""
             shutil.copy2(str(RESOLV_CONF), str(RESOLV_BACKUP))
             log.info("Backed up resolv.conf → %s", RESOLV_BACKUP)
 
@@ -106,6 +112,8 @@ def lock() -> None:
     else:
         log.warning("No existing resolv.conf found — creating fresh")
         _backup_created = False
+        _was_symlink = False
+        _symlink_target = ""
 
     # Step 3: Write locked DNS configuration
     RESOLV_CONF.write_text(LOCKED_CONTENT)
@@ -140,19 +148,25 @@ def restore() -> None:
         log.warning("Could not remove immutable flag: %s", exc)
 
     # Step 2: Restore from backup
-    if _backup_created and RESOLV_BACKUP.exists():
+    if _backup_created:
         try:
-            shutil.copy2(str(RESOLV_BACKUP), str(RESOLV_CONF))
-            log.info("[OK] Restored original resolv.conf from backup")
+            if _was_symlink and _symlink_target:
+                RESOLV_CONF.unlink(missing_ok=True)
+                os.symlink(_symlink_target, str(RESOLV_CONF))
+                log.info("[OK] Restored original resolv.conf symlink pointing to %s", _symlink_target)
+            elif RESOLV_BACKUP.exists():
+                shutil.copy2(str(RESOLV_BACKUP), str(RESOLV_CONF))
+                log.info("[OK] Restored original resolv.conf from backup")
         except OSError as exc:
             log.error("Failed to restore resolv.conf: %s", exc)
 
         # Step 3: Clean up backup
-        try:
-            RESOLV_BACKUP.unlink()
-            log.debug("Removed backup file: %s", RESOLV_BACKUP)
-        except OSError as exc:
-            log.warning("Could not remove backup file: %s", exc)
+        if RESOLV_BACKUP.exists():
+            try:
+                RESOLV_BACKUP.unlink()
+                log.debug("Removed backup file: %s", RESOLV_BACKUP)
+            except OSError as exc:
+                log.warning("Could not remove backup file: %s", exc)
     else:
         log.warning(
             "No backup file found at %s — resolv.conf may need manual restoration",

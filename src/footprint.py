@@ -159,9 +159,6 @@ def spoof_mac() -> None:
     iface = _detect_interface()
     original_mac = _get_current_mac(iface)
 
-    _state.interface = iface
-    _state.mac_address = original_mac
-
     is_wireless = iface.startswith("wl") or os.path.exists(f"/sys/class/net/{iface}/wireless")
 
     if is_wireless:
@@ -201,6 +198,9 @@ def spoof_mac() -> None:
             "TORVPN_FORCE_MAC_SPOOF=1: spoofing wireless MAC %s (Wi-Fi will drop)",
             iface,
         )
+
+    _state.interface = iface
+    _state.mac_address = original_mac
 
     new_mac = _generate_random_mac()
     log.info("Spoofing MAC on %s: %s → %s", iface, original_mac, new_mac)

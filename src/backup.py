@@ -152,6 +152,9 @@ def save() -> dict[str, Any]:
     iface = _detect_interface()
     mac = _get_mac(iface) if iface else None
 
+    is_symlink = RESOLV_CONF.is_symlink() if RESOLV_CONF.exists() else False
+    symlink_target = os.readlink(str(RESOLV_CONF)) if is_symlink else None
+
     data: dict[str, Any] = {
         "version": BACKUP_VERSION,
         "mac_address": mac,
@@ -159,6 +162,8 @@ def save() -> dict[str, Any]:
         "hostname": _get_hostname(),
         "timezone": _get_timezone(),
         "resolv_conf": _read_resolv_conf(),
+        "resolv_conf_is_symlink": is_symlink,
+        "resolv_conf_target": symlink_target,
     }
 
     # Ensure the backup directory exists.
@@ -262,15 +267,23 @@ def disaster_recovery() -> None:
 
         # -- Restore /etc/resolv.conf --
         resolv = data.get("resolv_conf")
-        if resolv:
+        is_symlink = data.get("resolv_conf_is_symlink", False)
+        symlink_target = data.get("resolv_conf_target")
+        if resolv or is_symlink:
             log.info("Restoring /etc/resolv.conf")
             # Remove immutable flag first (may have been set by dns.lock).
             try:
                 _run(["chattr", "-i", str(RESOLV_CONF)])
             except subprocess.CalledProcessError:
                 pass  # Flag wasn't set — that's fine.
-            RESOLV_CONF.write_text(resolv)
-            log.info("[OK] resolv.conf restored")
+
+            if is_symlink and symlink_target:
+                RESOLV_CONF.unlink(missing_ok=True)
+                os.symlink(symlink_target, str(RESOLV_CONF))
+                log.info("[OK] resolv.conf symlink restored to %s", symlink_target)
+            elif resolv:
+                RESOLV_CONF.write_text(resolv)
+                log.info("[OK] resolv.conf restored")
 
         # -- Clean up --
         delete()

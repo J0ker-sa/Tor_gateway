@@ -148,17 +148,21 @@ table {family} {table} {{
         # redirected back to itself, creating an infinite loop.
         meta skuid {tor_uid} accept
 
-        # Rule 2: LAN traffic is exempt from redirection.
+        # Rule 2: Redirect all DNS queries (UDP/TCP port 53) to Tor's DNS resolver.
+        # This prevents DNS leaks to the ISP's resolver.
+        # Must be placed BEFORE LAN/loopback exemptions so DNS queries to 127.0.0.1
+        # (defined in resolv.conf) are redirected to the Tor DNS port instead
+        # of hitting the loopback exemption rule.
+        udp dport 53 dnat ip to 127.0.0.1:{dns_port}
+        tcp dport 53 dnat ip to 127.0.0.1:{dns_port}
+
+        # Rule 3: LAN traffic is exempt from redirection.
         # This preserves local SSH, file sharing, printer access, etc.
         ip daddr {lan} accept
         ip6 daddr {lan6} accept
 
-        # Rule 3: Redirect all DNS queries (UDP/53) to Tor's DNS resolver.
-        # This prevents DNS leaks to the ISP's resolver.
-        udp dport 53 dnat ip to 127.0.0.1:{dns_port}
-
         # Rule 4: Redirect all outbound TCP to Tor's TransPort.
-        # The "!= {{trans_port}}" guard prevents double-redirection of
+        # The "!= {trans_port}" guard prevents double-redirection of
         # traffic that's already destined for the TransPort.
         tcp dport != {trans_port} dnat ip to 127.0.0.1:{trans_port}
     }}
@@ -429,21 +433,28 @@ def generate_iptables_commands(tor_uid: int) -> list[str]:
         f"{ipt} -t nat -A TORVPN_NAT -m owner --uid-owner {tor_uid} -j RETURN"
     )
 
-    # Rule 2: LAN subnets bypass redirection.
+    # Rule 2: Redirect DNS (UDP/53 and TCP/53) to Tor's DNSPort.
+    # Must be placed BEFORE LAN/loopback exemptions so DNS queries to 127.0.0.1
+    # (defined in resolv.conf) are redirected to the Tor DNS port instead
+    # of hitting the loopback exemption rule.
+    commands.append(
+        f"{ipt} -t nat -A TORVPN_NAT -p udp --dport 53 "
+        f"-j DNAT --to-destination 127.0.0.1:{TOR_DNS_PORT}"
+    )
+    commands.append(
+        f"{ipt} -t nat -A TORVPN_NAT -p tcp --dport 53 "
+        f"-j DNAT --to-destination 127.0.0.1:{TOR_DNS_PORT}"
+    )
+
+    # Rule 3: LAN subnets bypass redirection.
     for subnet in LAN_SUBNETS_LIST:
         commands.append(
             f"{ipt} -t nat -A TORVPN_NAT -d {subnet} -j RETURN"
         )
 
-    # Rule 3: Redirect DNS (UDP/53) to Tor's DNSPort.
-    commands.append(
-        f"{ipt} -t nat -A TORVPN_NAT -p udp --dport 53 "
-        f"-j DNAT --to-destination 127.0.0.1:{TOR_DNS_PORT}"
-    )
-
     # Rule 4: Redirect all TCP to Tor's TransPort.
     commands.append(
-        f"{ipt} -t nat -A TORVPN_NAT -p tcp "
+        f"{ipt} -t nat -A TORVPN_NAT -p tcp --dport != 53 "
         f"-j DNAT --to-destination 127.0.0.1:{TOR_TRANS_PORT}"
     )
 
