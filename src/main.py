@@ -102,6 +102,7 @@ _shutdown_event = threading.Event()   # Signals the main thread to begin teardow
 _is_tearing_down = False              # Guard against double teardown
 _tor_uid: int = 0                     # Populated after Tor starts
 _config: Config = Config()            # Populated by run()
+_maintenance_mode = False             # Set to True when intentionally stopping Tor for maintenance
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +168,7 @@ def _watchdog_loop() -> None:
         5. If all restarts fail, keep kill-switch active (full lockdown)
            and exit with ERROR_FIREWALL_FAILURE
     """
+    global _maintenance_mode
     restart_count = 0
 
     while not _shutdown_event.is_set():
@@ -177,6 +179,12 @@ def _watchdog_loop() -> None:
             break
 
         if not tor.is_alive():
+            if _maintenance_mode:
+                # Tor is intentionally stopped for maintenance (e.g., IP rotation).
+                # Do not panic or attempt restart; just wait for it to come back.
+                log.debug("Watchdog: Tor is temporarily stopped for maintenance (IP rotation)")
+                continue
+
             log.critical("=" * 60)
             log.critical("WATCHDOG: Tor process has died unexpectedly!")
             log.critical("=" * 60)
@@ -222,6 +230,50 @@ def _watchdog_loop() -> None:
                 log.error("WATCHDOG: Kill-switch remains active")
 
     log.debug("Watchdog thread exiting")
+
+
+def _ip_rotator_loop() -> None:
+    """Periodically restart Tor to obtain a new IP address.
+
+    This runs as a daemon thread and restarts Tor every 5 minutes (300 seconds)
+    to rotate the exit node and thus the public IP address.
+    """
+    global _maintenance_mode
+    while not _shutdown_event.is_set():
+        # Sleep for 5 minutes (300 seconds) but check for shutdown every second
+        # to allow timely termination.
+        for _ in range(300):
+            if _shutdown_event.is_set():
+                break
+            time.sleep(1)
+
+        if _shutdown_event.is_set():
+            break
+
+        # Only attempt rotation if Tor is alive (otherwise watchdog will handle restart)
+        if tor.is_alive():
+            log.info("IP rotator: Restarting Tor to obtain a new IP address...")
+            try:
+                # Enter maintenance mode so watchdog does not panic or attempt restart
+                _maintenance_mode = True
+                # Stop Tor
+                tor.stop()
+                # Start Tor again with the same bootstrap timeout
+                new_uid = tor.start(bootstrap_timeout=_config.bootstrap_timeout)
+                # Re-apply firewall with the same UID (should be same as before)
+                firewall.apply(new_uid)
+                log.info("IP rotator: Tor restarted successfully with new IP")
+            except Exception as exc:
+                log.error("IP rotator: Failed to restart Tor: %s", exc)
+                # If restart fails, we leave Tor stopped; the watchdog will detect
+                # the dead process and attempt recovery (but note we are in maintenance mode)
+            finally:
+                # Exit maintenance mode
+                _maintenance_mode = False
+        else:
+            log.debug("IP rotator: Tor is not alive, skipping rotation (watchdog will handle)")
+
+    log.debug("IP rotator thread exiting")
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +467,15 @@ def run() -> None:
         )
         watchdog_thread.start()
         log.info("[OK] Watchdog thread started (interval=%ds)", WATCHDOG_INTERVAL)
+
+        # ── Step 9: Start IP rotator (rotates exit node every 5 minutes) ──
+        ip_rotator_thread = threading.Thread(
+            target=_ip_rotator_loop,
+            daemon=True,
+            name="ip-rotator",
+        )
+        ip_rotator_thread.start()
+        log.info("[OK] IP rotator thread started (interval=300s)")
 
         # ── All systems go ──
         log.info("")
